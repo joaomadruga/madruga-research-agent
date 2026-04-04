@@ -74,7 +74,10 @@ def add_article(
     )
     storage.add_to_index(metadata)
 
-    embedding = embeddings.embed_text(f"{title}\n\n{wiki_note}")
+    if source.endswith(".pdf"):
+        embedding = embeddings.embed_pdf(source)
+    else:
+        embedding = embeddings.embed_text(f"{title}\n\n{wiki_note}")
     vector_store.upsert(slug, title, embedding)
 
     logger.info("Article '%s' added (slug: %s)", title, slug)

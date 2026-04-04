@@ -4,12 +4,17 @@ Called automatically on startup — only processes new or changed files.
 Can also be run standalone: uv run python ingest_papers.py
 """
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import hashlib
 from pathlib import Path
 
 from core.logger import get_logger
 from ingestion.pdf import read_pdf
 from kb.storage import load_index, slugify
+from kb.vector_store import init_db
 from tools.kb_tools import add_article
 
 logger = get_logger(__name__)
@@ -66,11 +71,5 @@ def sync_papers() -> None:
 
 
 if __name__ == "__main__":
-    from dotenv import load_dotenv
-
-    load_dotenv()
-
-    from kb.vector_store import init_db
-
     init_db()
     sync_papers()
