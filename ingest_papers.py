@@ -12,21 +12,36 @@ import hashlib
 from pathlib import Path
 
 from core.logger import get_logger
-from ingestion.pdf import read_pdf
-from kb.storage import load_index, slugify
-from kb.vector_store import init_db
-from tools.kb_tools import add_article
+from parsers.pdf import read_pdf
+from wiki.storage import KB_PATH, add_to_index, load_index, now_iso, slugify, write_source
+from core.schemas import ArticleMetadata
 
 logger = get_logger(__name__)
 
 PAPERS_DIR = Path(__file__).parent / "papers"
+WIKI_PATH = KB_PATH / "wiki"
 
 
 def _hash_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _init_wiki() -> None:
+    """Create wiki/index.md and wiki/log.md if they don't exist."""
+    WIKI_PATH.mkdir(parents=True, exist_ok=True)
+    index_path = WIKI_PATH / "index.md"
+    log_path = WIKI_PATH / "log.md"
+    if not index_path.exists():
+        index_path.write_text("# Wiki Index\n\n*No pages yet. Ask the agent to process a source.*\n")
+        logger.info("Created wiki/index.md")
+    if not log_path.exists():
+        log_path.write_text("# Research Log\n\n")
+        logger.info("Created wiki/log.md")
+
+
 def sync_papers() -> None:
+    _init_wiki()
+
     pdfs = sorted(PAPERS_DIR.glob("*.pdf"))
     if not pdfs:
         return
@@ -46,30 +61,33 @@ def sync_papers() -> None:
         logger.info("papers/ — %d files, nothing changed", len(pdfs))
         return
 
-    logger.info("Ingesting %d new/changed paper(s)...", len(pending))
+    logger.info("Storing %d new/changed paper(s)...", len(pending))
 
     failed = []
     for pdf, slug, file_hash in pending:
         try:
             content = read_pdf(str(pdf))
             title = pdf.stem.replace("_", " ").title()
-            add_article.invoke({
-                "title": title,
-                "content": content,
-                "source": str(pdf),
-                "tags": ["paper"],
-                "file_hash": file_hash,
-            })
+            write_source(slug, content)
+            metadata = ArticleMetadata(
+                title=title,
+                slug=slug,
+                source=str(pdf),
+                tags=["paper"],
+                created_at=now_iso(),
+                file_hash=file_hash,
+            )
+            add_to_index(metadata)
+            logger.info("Stored '%s'", title)
         except Exception as exc:
-            logger.error("Failed to ingest '%s': %s", pdf.name, exc)
+            logger.error("Failed to store '%s': %s", pdf.name, exc)
             failed.append(pdf.name)
 
     if failed:
-        logger.error("Failed to ingest: %s", ", ".join(failed))
+        logger.error("Failed to store: %s", ", ".join(failed))
     else:
-        logger.info("All %d papers ingested successfully", len(pending))
+        logger.info("All %d papers stored. Use the agent to process them into the wiki.", len(pending))
 
 
 if __name__ == "__main__":
-    init_db()
     sync_papers()

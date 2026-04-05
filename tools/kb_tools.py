@@ -1,68 +1,38 @@
+import base64
 import os
+import subprocess
 from typing import Annotated
 
+from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
 from tavily import TavilyClient
 
-import kb.embeddings as embeddings
-import kb.storage as storage
-import kb.vector_store as vector_store
+import wiki.storage as storage
 from core.logger import get_logger
-from core.schemas import ArticleMetadata, DeepDiveResult, SearchResult
-from ingestion.web import fetch_url as _fetch_url
-from llm.provider import get_llm
+from core.schemas import ArticleMetadata
+from parsers.pdf import extract_pdf_images
+from parsers.web import fetch_url as _fetch_url
+from agent.provider import get_llm
 
 logger = get_logger(__name__)
 
-_WIKI_COMPILATION_PROMPT = """\
-You are a research assistant. Summarize the following article into a structured markdown note.
-
-Use exactly these sections:
-## Summary
-(2-3 sentence overview)
-
-## Key Points
-(bullet list of the most important ideas)
-
-## Implications
-(why this matters, what it connects to)
-
-## Tags
-(comma-separated list of relevant topics/concepts)
-
-Article content:
----
-{content}
----
-"""
-
-
-def _compile_wiki_note(content: str) -> str:
-    llm = get_llm()
-    prompt = _WIKI_COMPILATION_PROMPT.format(content=content[:40_000])
-    logger.info("Compiling wiki note...")
-    response = llm.invoke(prompt)
-    return response.content
-
 
 @tool
-def add_article(
-    title: Annotated[str, "Title of the article"],
-    content: Annotated[str, "Full text content of the article"],
+def store_source(
+    title: Annotated[str, "Title of the article or paper"],
+    content: Annotated[str, "Full text content"],
     source: Annotated[str, "URL or file path or 'manual'"],
     tags: Annotated[list[str], "List of topic tags"],
     file_hash: Annotated[str | None, "SHA-256 hash of the source file, if any"] = None,
 ) -> str:
-    """Add a new article to the knowledge base. Compiles a wiki note automatically."""
+    """Save raw source content and register it in the index. Does not create wiki pages."""
     slug = storage.slugify(title)
     index = storage.load_index()
 
     if slug in index and file_hash is None:
         slug = f"{slug}-{storage.now_iso()[:10]}"
 
-    storage.write_raw(slug, content)
-    wiki_note = _compile_wiki_note(content)
-    storage.write_wiki(slug, wiki_note)
+    storage.write_source(slug, content)
 
     metadata = ArticleMetadata(
         title=title,
@@ -74,30 +44,26 @@ def add_article(
     )
     storage.add_to_index(metadata)
 
-    if source.endswith(".pdf"):
-        embedding = embeddings.embed_pdf(source)
-    else:
-        embedding = embeddings.embed_text(f"{title}\n\n{wiki_note}")
-    vector_store.upsert(slug, title, embedding)
-
-    logger.info("Article '%s' added (slug: %s)", title, slug)
-    return f"Article '{title}' added with slug '{slug}'."
+    logger.info("Source '%s' stored (slug: %s)", title, slug)
+    return f"Source '{title}' stored with slug '{slug}'."
 
 
 @tool
-def get_article(slug: Annotated[str, "Slug of the article"]) -> str:
-    """Read the wiki summary of a single article."""
+def read_source(
+    slug: Annotated[str, "Slug of the source"],
+) -> str:
+    """Read the raw text of a stored source."""
     index = storage.load_index()
     if slug not in index:
-        return f"No article found with slug '{slug}'."
-    return storage.read_wiki(slug)
+        return f"No source found with slug '{slug}'."
+    return storage.read_source(slug)
 
 
 @tool
-def list_articles(
+def list_sources(
     tag: Annotated[str | None, "Filter by tag (optional)"] = None,
 ) -> list[dict]:
-    """List all articles in the knowledge base, optionally filtered by tag."""
+    """List all stored sources, optionally filtered by tag."""
     index = storage.load_index()
     entries = list(index.values())
     if tag:
@@ -106,80 +72,111 @@ def list_articles(
 
 
 @tool
-def delete_article(slug: Annotated[str, "Slug of the article to delete"]) -> str:
-    """Delete an article from the knowledge base."""
-    index = storage.load_index()
-    if slug not in index:
-        return f"No article found with slug '{slug}'."
-    title = index[slug]["title"]
-    storage.delete_article(slug)
-    vector_store.delete(slug)
-    return f"Deleted article '{title}' (slug: '{slug}')."
-
-
-@tool
-def update_article_tags(
-    slug: Annotated[str, "Slug of the article"],
-    tags: Annotated[list[str], "New list of tags"],
+def delete_source(
+    slug: Annotated[str, "Slug of the source to delete"],
 ) -> str:
-    """Replace the tags on an existing article."""
+    """Delete a source and its wiki/sources page from the knowledge base."""
     index = storage.load_index()
     if slug not in index:
-        return f"No article found with slug '{slug}'."
-    index[slug]["tags"] = tags
-    storage.save_index(index)
-    return f"Tags updated for '{slug}'."
+        return f"No source found with slug '{slug}'."
+    title = index[slug]["title"]
+    storage.delete_source(slug)
+    return f"Deleted source '{title}' (slug: '{slug}')."
 
 
 @tool
-def search_knowledge_base(
-    query: Annotated[str, "Search query or question"],
-    top_k: Annotated[int, "Number of results to return"] = 5,
-) -> list[dict]:
-    """Search the knowledge base using semantic similarity. Returns the most relevant articles."""
+def read_wiki_page(
+    path: Annotated[str, "Wiki page path relative to wiki/ (e.g. 'index', 'concepts/chain-of-thought', 'sources/react')"],
+) -> str:
+    """Read a wiki page. Use 'index' to see all pages and navigate the wiki."""
+    try:
+        return storage.read_wiki_page(path)
+    except FileNotFoundError:
+        return f"No wiki page found at '{path}'. Call list_wiki_pages to see what exists."
+
+
+@tool
+def write_wiki_page(
+    path: Annotated[str, "Wiki page path relative to wiki/ (e.g. 'concepts/tool-use', 'sources/react')"],
+    content: Annotated[str, "Full markdown content for this page"],
+) -> str:
+    """Create or overwrite a wiki page. Use this to build and maintain the wiki."""
+    storage.write_wiki_page(path, content)
+    return f"Wiki page '{path}' written."
+
+
+@tool
+def list_wiki_pages() -> list[str]:
+    """List all wiki pages. Returns paths relative to wiki/ (without .md extension)."""
+    pages = storage.list_wiki_pages()
+    if not pages:
+        return ["(wiki is empty — no pages yet)"]
+    return pages
+
+
+@tool
+def describe_pdf_visuals(
+    slug: Annotated[str, "Slug of the PDF source to analyze"],
+) -> str:
+    """Describe all figures and diagrams in a PDF source using vision LLM.
+    Only processes pages that actually contain images — skips text-only pages.
+    Call this alongside read_source() when ingesting a paper."""
     index = storage.load_index()
-    if not index:
-        return []
+    if slug not in index:
+        return f"No source found with slug '{slug}'."
 
-    query_embedding = embeddings.embed_text(query)
-    slugs = vector_store.search(query_embedding, top_k=top_k)
+    source_path = index[slug]["source"]
+    if not source_path.endswith(".pdf"):
+        return "Source is not a PDF."
 
-    results = []
-    for slug in slugs:
-        if slug not in index:
-            continue
-        try:
-            content = storage.read_wiki(slug)
-        except FileNotFoundError:
-            continue
-        excerpt = content[:500].replace("\n", " ").strip()
-        results.append(
-            SearchResult(slug=slug, title=index[slug]["title"], excerpt=excerpt).model_dump()
+    images = extract_pdf_images(source_path)
+    if not images:
+        return "No embedded images found in this PDF."
+
+    llm = get_llm()
+    descriptions = []
+
+    for page_num, page_text, img_bytes in images:
+        b64 = base64.standard_b64encode(img_bytes).decode()
+        prompt = (
+            f"You are analyzing a figure from a research paper.\n\n"
+            f"Page {page_num} text:\n{page_text}\n\n"
+            f"Describe what this figure shows, referencing the surrounding text for context. "
+            f"Include: what type of visual it is (chart, diagram, table, architecture, etc.), "
+            f"what it demonstrates, and any key values or labels."
         )
+        message = HumanMessage(content=[
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+        ])
+        response = llm.invoke([message])
+        description = response.content.strip()
+        if description and "no visual content" not in description.lower():
+            descriptions.append(f"## Figure (page {page_num})\n\n{description}")
 
-    return results
+    if not descriptions:
+        return "No meaningful visual content found."
+
+    return "\n\n".join(descriptions)
 
 
 @tool
-def deep_dive_article(
-    slug: Annotated[str, "Slug of the article to load into context"],
-) -> dict:
-    """Load the full content of one article (raw + wiki) into context for deep analysis."""
-    index = storage.load_index()
-    if slug not in index:
-        return {"error": f"No article found with slug '{slug}'."}
-
-    metadata = ArticleMetadata(**index[slug])
-    try:
-        wiki = storage.read_wiki(slug)
-    except FileNotFoundError:
-        wiki = "(wiki note not found)"
-    try:
-        raw = storage.read_raw(slug)
-    except FileNotFoundError:
-        raw = "(raw content not found)"
-
-    return DeepDiveResult(metadata=metadata, wiki=wiki, raw=raw).model_dump()
+def search_wiki(
+    query: Annotated[str, "Search query to find relevant wiki pages"],
+    limit: Annotated[int, "Maximum number of results to return"] = 5,
+) -> str:
+    """Search the wiki using qmd hybrid search (BM25 + semantic vector). Returns relevant page paths and excerpts.
+    Use this before read_wiki_page to find which pages are relevant to a question."""
+    # Hybrid search: combines lex (BM25 keyword) and vec (semantic vector) for best recall
+    structured_query = f"lex:{query}\nvec:{query}"
+    result = subprocess.run(
+        ["qmd", "query", structured_query, "--json", "-n", str(limit)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return f"qmd search unavailable: {result.stderr.strip()}. Fall back to read_wiki_page('index')."
+    return result.stdout or "No results found."
 
 
 @tool
@@ -208,13 +205,15 @@ def search_web(
 
 def get_tool_list() -> list:
     return [
-        add_article,
-        get_article,
-        list_articles,
-        delete_article,
-        update_article_tags,
-        search_knowledge_base,
-        deep_dive_article,
+        store_source,
+        read_source,
+        describe_pdf_visuals,
+        list_sources,
+        delete_source,
+        search_wiki,
+        read_wiki_page,
+        write_wiki_page,
+        list_wiki_pages,
         fetch_url,
         search_web,
     ]

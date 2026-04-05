@@ -1,63 +1,42 @@
-# It is really hard to keep up with all the articles context in my brain so i'm splitting the responsability with an agent. Everything bellow is claude generated:
-
 # Research Agent
 
-A local, provider-agnostic research knowledge base powered by LLMs. Drop PDFs into `papers/`, ask questions, and get semantically-searched answers — all running on your machine.
+A personal knowledge base that compounds over time. Drop PDFs into `papers/`, add URLs, ask questions — the LLM maintains a structured wiki of interlinked markdown files that gets richer with every source you add.
 
 ## How it works
 
 ```
-papers/*.pdf  ──►  ingest (pypdf)  ──►  wiki note (LLM)  ──►  embedding  ──►  pgvector
-                                                                                    │
-you> what do I know about chain of thought?  ──►  embed query  ──►  cosine search ─┘
-                                                                         │
-                                                              LLM answers from top-k wikis
+papers/*.pdf  ──►  ingest  ──►  knowledge_base/sources/  (raw text, immutable)
+URL / manual  ──►  store   ──►                            (same)
+                                        │
+                              agent reads source
+                                        │
+                              writes wiki pages ──►  knowledge_base/wiki/
+                                        │                 sources/, concepts/, entities/
+                              you ask a question          index.md, log.md
+                                        │
+                              agent reads wiki pages ──►  synthesized answer
 ```
 
-- **Raw content** is stored in `knowledge_base/raw/`
-- **Compiled summaries** (wiki notes) are stored in `knowledge_base/wiki/`
-- **Embeddings** live in PostgreSQL with pgvector
-- **On every startup**, the `papers/` folder is synced — only new or changed files are re-ingested (SHA-256 hash check)
+- **Raw sources** are stored in `knowledge_base/sources/` — the LLM reads them, never modifies them
+- **The wiki** lives in `knowledge_base/wiki/` — entirely LLM-maintained markdown
+- **On every startup**, `papers/` is synced — only new or changed files are ingested (SHA-256 hash check)
 
 ## Requirements
 
 - [uv](https://docs.astral.sh/uv/)
-- [Ollama](https://ollama.com) — for local LLM and embeddings
-- [Docker](https://www.docker.com) — for PostgreSQL + pgvector
+- An LLM provider: [Anthropic](https://console.anthropic.com), [Ollama](https://ollama.com), or OpenAI
 
 ## Setup
 
-**1. Pull models**
-
-```bash
-ollama pull Gemma3:12b        # or any model you prefer
-ollama pull nomic-embed-text  # embedding model
-```
-
-**2. Start the database**
-
-```bash
-docker compose up -d
-```
-
-Postgres runs on port `5433` (to avoid conflicts with existing installations).
-
-| Field    | Value            |
-|----------|------------------|
-| Host     | localhost:5433   |
-| Database | research_agent   |
-| User     | research         |
-| Password | research         |
-
-**3. Configure `.env`**
+**1. Configure `.env`**
 
 ```bash
 cp .env.example .env
 ```
 
-Edit `.env` to match your setup. Defaults work out of the box for Ollama.
+Edit `.env` to set your provider and API key. Defaults to Anthropic.
 
-**4. Install dependencies**
+**2. Install dependencies**
 
 ```bash
 uv sync
@@ -73,24 +52,25 @@ On first run, all PDFs in `papers/` are ingested automatically. Subsequent runs 
 
 ### CLI commands
 
-| Command  | Action                              |
-|----------|-------------------------------------|
-| `/list`  | Show all articles in the knowledge base |
-| `/clear` | Clear conversation history (KB is kept) |
-| `/exit`  | Quit                                |
+| Command  | Action                                                   |
+|----------|----------------------------------------------------------|
+| `/list`  | Show all sources in the knowledge base                   |
+| `/lint`  | Health-check the wiki (orphans, stale claims, gaps)      |
+| `/clear` | Clear conversation history (knowledge base is kept)      |
+| `/exit`  | Quit                                                     |
 
-Everything else is free-form — just talk to it:
+Everything else is free-form:
 
 ```
 you> what papers do you have about reasoning?
-you> deep dive into react
+you> ingest react
 you> how does ReAct compare to Plan and Solve?
 you> add this article: https://example.com/paper
 ```
 
 ## Adding content
 
-**PDFs** — drop them into `papers/` and restart. They'll be ingested automatically.
+**PDFs** — drop them into `papers/` and restart. Ingested automatically.
 
 **URLs** — ask the agent directly:
 ```
@@ -106,34 +86,15 @@ you> add a note titled "My Research Notes" with content: ...
 
 All providers are switched via `.env` — no code changes needed.
 
-### LLM
-
 ```env
-LLM_PROVIDER=ollama        # ollama | anthropic | openai
-MODEL=Gemma3:12b
-OLLAMA_BASE_URL=http://localhost:11434
+LLM_PROVIDER=anthropic   # anthropic | ollama | openai
+MODEL=claude-sonnet-4-6
+ANTHROPIC_API_KEY=your-key-here
 ```
-
-### Embeddings
-
-```env
-EMBEDDING_PROVIDER=ollama  # ollama | gemini
-EMBEDDING_MODEL=nomic-embed-text
-```
-
-> **Note:** Changing embedding providers requires dropping the `article_embeddings` table and re-ingesting, since vector dimensions differ between models.
-
-Supported embedding models and their dimensions:
-
-| Model                        | Provider | Dimensions |
-|------------------------------|----------|------------|
-| `nomic-embed-text`           | ollama   | 768        |
-| `mxbai-embed-large`          | ollama   | 1024       |
-| `gemini-embedding-2-preview` | gemini   | 3072       |
 
 ## Claude Code integration (MCP)
 
-The agent exposes its tools as an MCP server so Claude Code can query your knowledge base directly from any session.
+The agent exposes its tools as an MCP server so Claude Code can read and write your knowledge base directly from any session.
 
 **Register once:**
 
@@ -147,17 +108,20 @@ claude mcp add research-agent uv -- --directory /path/to/research-agent run pyth
 claude mcp list
 ```
 
-Make sure Ollama and Docker are running before opening Claude Code — the MCP server connects to both at startup.
-
 **Available tools in Claude Code:**
 
-- `search_knowledge_base` — semantic search over all articles
-- `deep_dive_article` — load full raw + wiki content into context
-- `list_articles` — browse the index
-- `add_article` — add content manually
-- `fetch_and_add_url` — fetch a URL and add it
+- `store_source` — save raw content to the knowledge base
+- `read_source` — read the raw text of a stored source
+- `list_sources` — browse the index, optionally filtered by tag
+- `read_wiki_page` — read a wiki page (e.g. `index`, `concepts/chain-of-thought`)
+- `write_wiki_page` — create or overwrite a wiki page
+- `list_wiki_pages` — list all wiki pages
+- `fetch_and_add_url` — fetch a URL and store it as a source
 - `add_local_file` — ingest a local PDF or text file
-- `delete_article` — remove an article
+
+## Wiki schema
+
+See [`WIKI.md`](WIKI.md) for the wiki directory structure, page formats, frontmatter conventions, and how `index.md` / `log.md` are maintained.
 
 ## Project structure
 
@@ -166,21 +130,20 @@ research-agent/
 ├── main.py              # CLI entry point (REPL)
 ├── mcp_server.py        # MCP server for Claude Code integration
 ├── ingest_papers.py     # PDF sync logic (called on startup)
+├── WIKI.md              # Wiki schema and conventions
 ├── papers/              # Drop PDFs here
 ├── knowledge_base/
-│   ├── index.json       # Article metadata registry
-│   ├── raw/             # Original ingested content
-│   └── wiki/            # LLM-compiled structured summaries
+│   ├── index.json       # Source metadata registry
+│   ├── sources/         # Raw ingested content (immutable)
+│   └── wiki/            # LLM-maintained wiki pages
 ├── core/
-│   ├── logger.py        # Structured logging via RichHandler
-│   └── schemas.py       # Pydantic models
+│   ├── logger.py
+│   └── schemas.py
 ├── kb/
-│   ├── storage.py       # File I/O and index management
-│   ├── embeddings.py    # Gemini / Ollama embedding client
-│   └── vector_store.py  # pgvector operations
+│   └── storage.py       # File I/O and index management
 ├── llm/
 │   ├── provider.py      # LLM factory (anthropic / ollama / openai)
-│   └── agent.py         # Tool-call loop (LangChain)
+│   └── agent.py         # Tool-call loop
 ├── ingestion/
 │   ├── web.py           # URL scraping
 │   └── pdf.py           # PDF and local file reading
@@ -190,6 +153,4 @@ research-agent/
 
 ## Known limitations
 
-- **PDF images are ignored** — figures, charts, and diagrams in papers are not embedded. Only text is extracted via `pypdf`.
 - **Conversation history is in-memory** — lost on restart. The knowledge base itself is the persistence layer.
-- **No authentication** — the Postgres instance has no TLS or strong credentials, intended for local use only.

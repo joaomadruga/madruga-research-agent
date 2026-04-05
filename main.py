@@ -8,9 +8,8 @@ from rich.panel import Panel
 load_dotenv()
 
 from ingest_papers import sync_papers
-from kb.storage import load_index
-from kb.vector_store import init_db
-from llm.agent import Agent
+from wiki.storage import load_index
+from agent.agent import Agent
 
 console = Console()
 
@@ -32,12 +31,11 @@ def main() -> None:
         Panel(
             "[bold cyan]Research Agent[/bold cyan]\n"
             "[dim]Your personal knowledge base assistant[/dim]\n\n"
-            "Commands: [bold]/list[/bold] · [bold]/clear[/bold] · [bold]/exit[/bold]",
+            "Commands: [bold]/list[/bold] · [bold]/lint[/bold] · [bold]/clear[/bold] · [bold]/exit[/bold]",
             border_style="cyan",
         )
     )
 
-    init_db()
     sync_papers()
     agent = Agent()
 
@@ -57,6 +55,14 @@ def main() -> None:
 
         if user_input == "/list":
             _print_article_list()
+            continue
+
+        if user_input == "/lint":
+            try:
+                response = agent.chat("lint the wiki")
+                console.print(Markdown(response))
+            except Exception as exc:
+                console.print(f"[red]Error:[/red] {exc}")
             continue
 
         if user_input == "/clear":
